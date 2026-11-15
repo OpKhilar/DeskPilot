@@ -18,7 +18,7 @@ import {
   UserRound,
   Wand2,
 } from "lucide-react";
-import { AnalyticsView } from "@/components/analytics/AnalyticsView";
+import AnalyticsView from "@/components/analytics/AnalyticsView";
 import { useDeskStore } from "@/lib/store";
 import type {
   KnowledgeGapStatus,
