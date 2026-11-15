@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import type { KbDoc, Order, TicketCategory, TicketPriority } from "@/lib/types";
+import type { Order, TicketCategory, TicketPriority } from "@/lib/types";
+import {
+  retrieveRelevantChunks,
+  type RetrievedChunk,
+} from "@/lib/ragEngine";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,6 +43,7 @@ export interface ChatApiResponse {
   category: TicketCategory;
   priority: TicketPriority;
   suggestedAgentReply: string;
+  retrievedChunks: RetrievedChunk[];
   toolCall?: { name: ToolName; arguments: Record<string, unknown> };
 }
 
@@ -56,14 +61,11 @@ interface IncomingMessage {
 interface ChatRequestBody {
   ticketId?: unknown;
   messages?: unknown;
-  kbDocs?: unknown;
   orders?: unknown;
 }
 
-const MAX_KB_DOCS = 20;
 const MAX_ORDERS = 50;
 const MAX_MESSAGES = 40;
-const MAX_KB_CHARS_PER_DOC = 1400;
 
 function text(value: unknown, max: number): string {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
@@ -88,31 +90,6 @@ function normaliseMessages(raw: unknown): ChatCompletionMessageParam[] {
       const sender = text(item.sender ?? item.role, 20).toLowerCase();
       const isCustomer = ["customer", "user", "human"].includes(sender);
       return [{ role: isCustomer ? "user" : "assistant", content: body }];
-    });
-}
-
-function normaliseKbDocs(raw: unknown): KbDoc[] {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .slice(0, MAX_KB_DOCS)
-    .flatMap((entry) => {
-      if (!isRecord(entry)) return [];
-      const id = text(entry.id, 80);
-      const title = text(entry.title, 160);
-      const content = text(entry.content, MAX_KB_CHARS_PER_DOC);
-      if (!id || !title || !content) return [];
-      return [
-        {
-          id,
-          title,
-          version: text(entry.version, 20) || "v1.0",
-          content,
-          category: (text(entry.category, 24) || "Other") as KbDoc["category"],
-          updatedAt: text(entry.updatedAt, 40),
-          citationCount:
-            typeof entry.citationCount === "number" ? entry.citationCount : 0,
-        },
-      ];
     });
 }
 
@@ -185,9 +162,10 @@ ORDERS AND REFUNDS
 - Use toolCall "lookup_order" with {"orderId":"ORD-..."} when you need the order record, "create_refund_request" when a damaged/return claim qualifies, and "escalate_to_human" when handing off.
 
 POLICY ANSWERS AND CITATIONS
-- When answering a policy question (returns, refunds, shipping timelines, warranty, payments), ground the answer in the provided Knowledge Base and cite the exact document and version as "Document Title (vX.Y)", e.g. "Return & Refund Policy (v1.2)".
-- Never cite a document that is not in the provided Knowledge Base, and never cite a version other than the one provided. One citation per reply; null if the reply does not rely on a policy document.
-- If the KB is silent or only partly answers, do not fill the gap with assumptions.
+- Ground every policy answer ONLY in the retrieved knowledge-base chunks in the context. Do not use the customer-supplied KB list, general knowledge, or assumptions.
+- Answer in the customer's language: English or natural Hinglish in Roman script, matching their style.
+- Cite the exact source document and version from a retrieved chunk as "Document Title (vX.Y)", e.g. "Return & Refund Policy (v1.2)". Set citation to null unless a retrieved chunk directly supports the answer.
+- Never cite a document or version not present in the retrieved chunks. If they do not answer the question, do not guess; mark a knowledge gap and escalate.
 
 KNOWLEDGE GAPS AND ESCALATION
 - If the answer is not in the KB AND the message is not a lookup answerable from the provided orders, set isKnowledgeGap: true and escalate: true, and tell the customer warmly that a human specialist is stepping in to confirm.
@@ -223,7 +201,7 @@ Return ONLY valid JSON, no markdown fences, matching exactly:
 
 function buildContextMessage(
   ticketId: string,
-  kbDocs: KbDoc[],
+  retrievedChunks: RetrievedChunk[],
   orders: OrderContext[],
 ): string {
   const orderLines = orders.length
@@ -245,14 +223,14 @@ function buildContextMessage(
         .join("\n")
     : "- No orders supplied for this customer.";
 
-  const kbLines = kbDocs.length
-    ? kbDocs
+  const kbLines = retrievedChunks.length
+    ? retrievedChunks
         .map(
-          (doc) =>
-            `### ${doc.title} (${doc.version}) [id: ${doc.id}, category: ${doc.category}]\n${doc.content}`,
+          (chunk) =>
+            `### ${chunk.title} (${chunk.version}) [docId: ${chunk.docId}, chunk: ${chunk.chunkIndex}]\n${chunk.text}`,
         )
         .join("\n\n")
-    : "No knowledge base documents were supplied.";
+    : "No relevant knowledge-base chunks were retrieved.";
 
   return `TICKET: ${ticketId}
 CURRENT TIME (IST): ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
@@ -260,7 +238,7 @@ CURRENT TIME (IST): ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolka
 CUSTOMER ORDERS (authoritative):
 ${orderLines}
 
-KNOWLEDGE BASE (authoritative):
+RETRIEVED KNOWLEDGE-BASE CHUNKS (the only authoritative policy source):
 ${kbLines}`;
 }
 
@@ -289,18 +267,23 @@ function coercePriority(value: unknown): TicketPriority {
  * version. The model's string is only used to identify the document; the
  * returned label is rebuilt from the KB record so it cannot be paraphrased.
  */
-function verifyCitation(raw: unknown, kbDocs: KbDoc[]): string | null {
+function verifyCitation(
+  raw: unknown,
+  retrievedChunks: RetrievedChunk[],
+): string | null {
   if (typeof raw !== "string" || !raw.trim()) return null;
+  const version = /\((v[\d.]+)\)\s*$/i.exec(raw.trim())?.[1];
   const cleaned = raw
     .replace(/\s*\((?:v|version)\s*[\d.]+\)\s*$/i, "")
     .trim()
     .toLowerCase();
-  if (!cleaned) return null;
+  if (!cleaned || !version) return null;
 
-  const doc =
-    kbDocs.find((entry) => entry.id.toLowerCase() === cleaned) ??
-    kbDocs.find((entry) => entry.title.toLowerCase() === cleaned) ??
-    kbDocs.find((entry) => cleaned.includes(entry.title.toLowerCase()));
+  const doc = retrievedChunks.find(
+    (chunk) =>
+      chunk.title.toLowerCase() === cleaned &&
+      chunk.version.toLowerCase() === version.toLowerCase(),
+  );
 
   return doc ? `${doc.title} (${doc.version})` : null;
 }
@@ -317,7 +300,7 @@ const ORDER_INTENT =
   /(mera|meri|mere|my)\s+(order|parcel|shipment|refund|payment)|order\s+kab|kahan\s+(hai|pahunch)|refund\s+(chahiye|kab|karo)|damaged\s+(aaya|aa\s?gaya)|order\s+(kiya|diya)|tracking\s+(link|nahi)/i;
 
 const HINGLISH_MARKERS =
-  /\b(kya|kab|kahan|kaise|hai|nahin|nahi|bhai|chahiye|mera|meri|aayega|aaya|gaya|kiya|karo|kar|do|ho|mujhe|paise|paisa|wapas|wapis|pahuncha|bhejo|batao)\b/i;
+  /\b(kya|kab|kahan|kaise|hai|nahin|nahi|bhai|chahiye|mera|meri|aayega|aaya|gaya|kiya|karo|kar|ho|mujhe|paise|paisa|wapas|wapis|pahuncha|bhejo|batao)\b/i;
 
 function detectHinglish(messages: ChatCompletionMessageParam[]): boolean {
   const customerText = messages
@@ -357,7 +340,6 @@ export async function POST(request: Request) {
 
   const ticketId = text(body.ticketId, 64);
   const messages = normaliseMessages(body.messages);
-  const kbDocs = normaliseKbDocs(body.kbDocs);
   const orders = normaliseOrders(body.orders);
 
   if (!ticketId) {
@@ -373,7 +355,57 @@ export async function POST(request: Request) {
     );
   }
 
+  const latestCustomerMessage = [...messages]
+    .reverse()
+    .find((message) => message.role === "user");
+  if (!latestCustomerMessage || typeof latestCustomerMessage.content !== "string") {
+    return NextResponse.json(
+      { error: "messages must contain a customer message." },
+      { status: 400 },
+    );
+  }
+  const latestCustomerText = latestCustomerMessage.content.trim();
+
+  let retrievedChunks: RetrievedChunk[];
+  let topScore: number;
+  try {
+    const retrieval = await retrieveRelevantChunks(latestCustomerText, 3);
+    retrievedChunks = retrieval.chunks;
+    topScore = retrieval.topScore;
+  } catch (error) {
+    console.error("[api/chat] RAG retrieval failed", {
+      name: error instanceof Error ? error.name : "unknown",
+    });
+    return NextResponse.json(
+      { error: "DeskPilot could not search the knowledge base. Please retry." },
+      { status: 500 },
+    );
+  }
+
   const hinglish = detectHinglish(messages);
+  const hasSpecificOrderId = /ORD-\d{3,6}/i.test(latestCustomerText);
+
+  if (topScore < 0.3 && !hasSpecificOrderId) {
+    const reply = hinglish
+      ? "Is sawal ka sahi jawab confirm karne ke liye main ise apni support team ko bhej raha hoon. Woh aapko jald update karenge."
+      : "I’m escalating this to a support specialist to confirm the right answer. They’ll follow up with you shortly.";
+    const response: ChatApiResponse = {
+      reply,
+      citation: null,
+      isKnowledgeGap: true,
+      escalate: true,
+      category: "Other",
+      priority: "high",
+      suggestedAgentReply: reply,
+      retrievedChunks: [],
+      toolCall: { name: "escalate_to_human", arguments: {} },
+    };
+    return NextResponse.json(response);
+  }
+
+  // Low-confidence chunks are not passed to the model, even when an order ID
+  // allows an order lookup to continue.
+  if (topScore < 0.3) retrievedChunks = [];
 
   // Deterministic guard: a "my order / refund" request without an Order ID must
   // never reach a policy answer or a promised action.
@@ -394,6 +426,7 @@ export async function POST(request: Request) {
       category: "Order Tracking",
       priority: "medium",
       suggestedAgentReply: reply,
+      retrievedChunks: [],
       toolCall: { name: "request_order_id", arguments: {} },
     };
     return NextResponse.json(response);
@@ -426,7 +459,7 @@ export async function POST(request: Request) {
         { role: "system", content: SYSTEM_PROMPT },
         {
           role: "system",
-          content: buildContextMessage(ticketId, kbDocs, orders),
+          content: buildContextMessage(ticketId, retrievedChunks, orders),
         },
         ...messages,
       ],
@@ -461,7 +494,9 @@ export async function POST(request: Request) {
     const isKnowledgeGap = parsed.isKnowledgeGap === true;
     // Gaps always escalate, and a gap must never carry a policy citation.
     const escalate = parsed.escalate === true || isKnowledgeGap;
-    const citation = isKnowledgeGap ? null : verifyCitation(parsed.citation, kbDocs);
+    const citation = isKnowledgeGap
+      ? null
+      : verifyCitation(parsed.citation, retrievedChunks);
     const suggested = text(parsed.suggestedAgentReply, 2000) || reply;
     const toolCall = coerceToolCall(parsed.toolCall);
 
@@ -480,6 +515,7 @@ export async function POST(request: Request) {
       category: coerceCategory(parsed.category),
       priority: coercePriority(parsed.priority),
       suggestedAgentReply: suggested,
+      retrievedChunks,
       ...(toolCall ? { toolCall } : {}),
     };
 
