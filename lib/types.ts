@@ -79,6 +79,8 @@ export interface Citation {
   version: string;
   /** Exact passage the AI quoted. */
   snippet: string;
+  /** Retrieval confidence (0–100) when the passage came from RAG search. */
+  matchScore?: number;
 }
 
 export type ActionLogType =
