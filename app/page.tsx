@@ -19,6 +19,7 @@ import {
   Wand2,
 } from "lucide-react";
 import AnalyticsView from "@/components/analytics/AnalyticsView";
+import KnowledgeBaseView from "@/components/kb/KnowledgeBaseView";
 import { useDeskStore } from "@/lib/store";
 import type {
   KnowledgeGapStatus,
@@ -105,7 +106,7 @@ function lastCustomerFacingMessage(ticket: Ticket) {
 }
 
 export default function DeskOverviewPage() {
-  const [tab, setTab] = useState<"inbox" | "analytics">("inbox");
+  const [tab, setTab] = useState<"inbox" | "kb" | "analytics">("inbox");
   const {
     tickets,
     orders,
@@ -173,6 +174,19 @@ export default function DeskOverviewPage() {
         </button>
         <button
           type="button"
+          onClick={() => setTab("kb")}
+          aria-current={tab === "kb" ? "page" : undefined}
+          className={`focus-ring inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-medium transition ${
+            tab === "kb"
+              ? "bg-cream-200 text-charcoal-900"
+              : "text-ash-300 hover:bg-charcoal-700/70 hover:text-cream-100"
+          }`}
+        >
+          <BookOpen className="h-3.5 w-3.5" />
+          Knowledge base
+        </button>
+        <button
+          type="button"
           onClick={() => setTab("analytics")}
           aria-current={tab === "analytics" ? "page" : undefined}
           className={`focus-ring inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-medium transition ${
@@ -189,6 +203,10 @@ export default function DeskOverviewPage() {
       {tab === "analytics" ? (
         <div className="mt-6">
           <AnalyticsView />
+        </div>
+      ) : tab === "kb" ? (
+        <div className="mt-6">
+          <KnowledgeBaseView />
         </div>
       ) : (
         <>

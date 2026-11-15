@@ -1,9 +1,10 @@
 "use client";
 
-// Knowledge base workspace: policy articles on the left, AI-detected gaps on the
+// Knowledge base workspace: company files can be uploaded and indexed into the
+// RAG vector store, policy articles sit on the left and AI-detected gaps on the
 // right. Editing an article bumps its minor version (v1.2 -> v1.3) and records a
-// revision entry, so versioning can be demonstrated live. A gap can spawn a new
-// article, which resolves the gap in the store.
+// revision entry; publishing an article (or an article made from a gap) writes
+// it straight into the vector store.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
@@ -14,12 +15,15 @@ import {
   CheckCircle2,
   ChevronDown,
   Clock,
+  Database,
   History,
+  Loader2,
   Pencil,
   Plus,
   Search,
   Sparkles,
   TrendingUp,
+  UploadCloud,
   X,
 } from "lucide-react";
 import { useDeskStore } from "@/lib/store";
@@ -34,6 +38,9 @@ import type {
 const HISTORY_STORAGE_KEY = "deskpilot:kb-history:v1";
 
 const CATEGORIES: KbCategory[] = ["Returns", "Shipping", "Warranty", "Payments"];
+
+const ACCEPTED_FILES = ".pdf,.txt,.md,.csv";
+const MAX_UPLOAD_BYTES = 2 * 1024 * 1024;
 
 const updatedFmt = new Intl.DateTimeFormat("en-IN", {
   day: "2-digit",
@@ -112,6 +119,45 @@ interface Draft {
   content: string;
 }
 
+/** Shapes returned by /api/kb/upload and /api/kb/index. */
+interface RagChunkView {
+  id: string;
+  docId: string;
+  index: number;
+  start: number;
+  end: number;
+  chars: number;
+  overlapsNext: number;
+  text: string;
+  vector: { dim: number; status: string; norm: number; preview: string };
+}
+
+interface IndexedDocView {
+  id: string;
+  title: string;
+  source: string;
+  chars: number;
+  chunkCount: number;
+  avgChunkChars: number;
+  indexedAt: string;
+}
+
+interface IndexResponse {
+  ok: true;
+  doc: IndexedDocView;
+  chunks: RagChunkView[];
+  text?: string;
+  truncated?: boolean;
+}
+
+interface UploadState {
+  status: "uploading" | "done" | "error";
+  fileName: string;
+  chunkCount?: number;
+  chars?: number;
+  message?: string;
+}
+
 function bumpMinorVersion(version: string): string {
   const match = /^v?(\d+)\.(\d+)$/i.exec(version.trim());
   if (!match) return "v1.1";
@@ -131,6 +177,27 @@ function makeEntryId(): string {
   return `ver-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function titleFromFileName(fileName: string): string {
+  const base = fileName.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim();
+  if (!base) return "Uploaded document";
+  return base.charAt(0).toUpperCase() + base.slice(1);
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isSupportedFileName(fileName: string): boolean {
+  return /\.(pdf|txt|md|csv)$/i.test(fileName);
+}
+
+function guessCategoryFromText(text: string): KbCategory {
+  const hint = categoryHints.find(({ pattern }) => pattern.test(text));
+  return hint?.category ?? "Returns";
+}
+
 export default function KnowledgeBaseView() {
   const {
     kbDocs,
@@ -147,6 +214,14 @@ export default function KnowledgeBaseView() {
   const [flash, setFlash] = useState<string | null>(null);
   const [history, setHistory] = useState<Record<string, VersionEntry[]>>({});
   const [historyLoaded, setHistoryLoaded] = useState(false);
+
+  // RAG indexing state.
+  const [dragActive, setDragActive] = useState(false);
+  const [upload, setUpload] = useState<UploadState | null>(null);
+  const [chunksByDoc, setChunksByDoc] = useState<Record<string, IndexResponse>>({});
+  const [openChunksId, setOpenChunksId] = useState<string | null>(null);
+  const [chunkLoadingId, setChunkLoadingId] = useState<string | null>(null);
+  const [chunkErrors, setChunkErrors] = useState<Record<string, string>>({});
 
   // Revision history is tied to persisted documents, so it is persisted too.
   useEffect(() => {
@@ -213,13 +288,153 @@ export default function KnowledgeBaseView() {
 
   const totalCitations = kbDocs.reduce((sum, doc) => sum + doc.citationCount, 0);
 
+  const indexedDocCount = Object.keys(chunksByDoc).length;
+
   function guessCategory(gap: KnowledgeGap): KbCategory {
     const suggested = kbDocs.find(
       (doc) => doc.id === gap.suggestedKbDocId,
     )?.category;
     if (suggested) return suggested;
-    const hint = categoryHints.find(({ pattern }) => pattern.test(gap.query));
-    return hint?.category ?? "Returns";
+    return guessCategoryFromText(gap.query);
+  }
+
+  /** POST a policy article to the vector store and cache its chunks. */
+  const indexArticle = useCallback(
+    async (docId: string, title: string, content: string): Promise<IndexResponse | null> => {
+      try {
+        const response = await fetch("/api/kb/index", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ docId, title, content }),
+        });
+        const data = (await response.json().catch(() => null)) as
+          | (IndexResponse | { message?: string })
+          | null;
+
+        if (!response.ok || !data || !("ok" in data) || !data.ok) {
+          const message =
+            data && "message" in data && data.message
+              ? data.message
+              : "The RAG index rejected this article.";
+          setChunkErrors((prev) => ({ ...prev, [docId]: message }));
+          return null;
+        }
+
+        setChunksByDoc((prev) => ({ ...prev, [docId]: data }));
+        setChunkErrors((prev) => {
+          const next = { ...prev };
+          delete next[docId];
+          return next;
+        });
+        return data;
+      } catch {
+        setChunkErrors((prev) => ({
+          ...prev,
+          [docId]: "Could not reach /api/kb/index.",
+        }));
+        return null;
+      }
+    },
+    [],
+  );
+
+  /** Upload a company file, index it, and add it to the knowledge base. */
+  const uploadFile = useCallback(
+    async (file: File) => {
+      if (!isSupportedFileName(file.name)) {
+        setUpload({
+          status: "error",
+          fileName: file.name,
+          message: "Only .PDF, .TXT, .MD and .CSV files can be indexed.",
+        });
+        return;
+      }
+
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setUpload({
+          status: "error",
+          fileName: file.name,
+          message: `${formatBytes(file.size)} exceeds the 2 MB limit.`,
+        });
+        return;
+      }
+
+      const title = titleFromFileName(file.name);
+      const docId = makeDocId(title);
+      setUpload({ status: "uploading", fileName: file.name });
+
+      try {
+        const body = new FormData();
+        body.append("file", file);
+        body.append("docId", docId);
+        body.append("title", title);
+
+        const response = await fetch("/api/kb/upload", { method: "POST", body });
+        const data = (await response.json().catch(() => null)) as
+          | (IndexResponse | { message?: string })
+          | null;
+
+        if (!response.ok || !data || !("ok" in data) || !data.ok) {
+          const message =
+            data && "message" in data && data.message
+              ? data.message
+              : "Indexing failed.";
+          setUpload({ status: "error", fileName: file.name, message });
+          return;
+        }
+
+        const text = data.text ?? "";
+        addKbDoc({
+          id: docId,
+          title,
+          version: "v1.0",
+          content: text,
+          category: guessCategoryFromText(`${title} ${text}`),
+          updatedAt: new Date().toISOString(),
+          citationCount: 0,
+        });
+        logVersion(docId, {
+          id: makeEntryId(),
+          version: "v1.0",
+          previousVersion: null,
+          note: `Imported from ${file.name} · ${data.doc.chunkCount} chunks indexed${
+            data.truncated ? " (text truncated in the editor)" : ""
+          }`,
+          savedAt: new Date().toISOString(),
+        });
+
+        setChunksByDoc((prev) => ({ ...prev, [docId]: data }));
+        setOpenChunksId(docId);
+        setUpload({
+          status: "done",
+          fileName: file.name,
+          chunkCount: data.doc.chunkCount,
+          chars: data.doc.chars,
+        });
+      } catch {
+        setUpload({
+          status: "error",
+          fileName: file.name,
+          message: "Could not reach /api/kb/upload — is the dev server running?",
+        });
+      }
+    },
+    [addKbDoc, logVersion],
+  );
+
+  /** Show the stored chunks, indexing the article first if needed. */
+  async function toggleChunks(doc: KbDoc) {
+    if (openChunksId === doc.id) {
+      setOpenChunksId(null);
+      return;
+    }
+
+    setOpenChunksId(doc.id);
+    if (chunksByDoc[doc.id]) return;
+
+    setChunkLoadingId(doc.id);
+    await indexArticle(doc.id, doc.title, doc.content);
+    setChunkLoadingId(null);
   }
 
   function openNewArticle() {
@@ -254,7 +469,11 @@ export default function KnowledgeBaseView() {
     });
   }
 
-  function handleSave(values: { title: string; category: KbCategory; content: string }) {
+  async function handleSave(values: {
+    title: string;
+    category: KbCategory;
+    content: string;
+  }): Promise<void> {
     if (!draft) return;
     const title = values.title.trim();
     const content = values.content.trim();
@@ -283,8 +502,13 @@ export default function KnowledgeBaseView() {
         savedAt,
       });
 
+      const indexed = await indexArticle(doc.id, title, content);
       setExpandedId(doc.id);
-      setFlash(`${title} saved as ${nextVersion} — version history logged.`);
+      setFlash(
+        indexed
+          ? `${title} saved as ${nextVersion} — re-indexed ${indexed.doc.chunkCount} chunks.`
+          : `${title} saved as ${nextVersion} — vector re-index failed.`,
+      );
       setDraft(null);
       return;
     }
@@ -311,18 +535,30 @@ export default function KnowledgeBaseView() {
       savedAt,
     });
 
+    const indexed = await indexArticle(docId, title, content);
+    setOpenChunksId(docId);
+
     if (draft.gapId) {
       setKnowledgeGapStatus(draft.gapId, "resolved");
       updateKnowledgeGap(draft.gapId, {
-        resolutionNote: `Resolved by “${title}” (${doc.version})`,
+        resolutionNote: indexed
+          ? `Resolved by “${title}” (${doc.version}) · ${indexed.doc.chunkCount} chunks indexed in the RAG vector DB`
+          : `Resolved by “${title}” (${doc.version})`,
         suggestedKbDocId: docId,
       });
-      setFlash(`“${title}” published · knowledge gap marked RESOLVED.`);
+      setFlash(
+        indexed
+          ? `“${title}” indexed as ${indexed.doc.chunkCount} chunks · knowledge gap RESOLVED.`
+          : `“${title}” published · knowledge gap RESOLVED (vector index failed).`,
+      );
     } else {
-      setFlash(`“${title}” created at v1.0.`);
+      setFlash(
+        indexed
+          ? `“${title}” created at v1.0 · ${indexed.doc.chunkCount} chunks indexed.`
+          : `“${title}” created at v1.0 — vector indexing failed.`,
+      );
     }
 
-    setExpandedId(docId);
     setDraft(null);
   }
 
@@ -334,7 +570,7 @@ export default function KnowledgeBaseView() {
     : undefined;
 
   return (
-    <main className="mx-auto w-full max-w-7xl px-5 py-8 sm:px-8">
+    <div className="w-full">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div className="flex items-center gap-3">
           <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-brand-500 text-cream-100 shadow-glow">
@@ -346,20 +582,127 @@ export default function KnowledgeBaseView() {
             </h1>
             <p className="text-sm text-ash-400">
               {kbDocs.length} policies · {totalCitations} citations ·{" "}
-              {openGapCount} open gaps
+              {openGapCount} open gaps · {indexedDocCount} in the RAG index
             </p>
           </div>
         </div>
+        <span className="pill self-start bg-charcoal-800 text-ash-300 ring-1 ring-inset ring-charcoal-600">
+          <Database className="h-3 w-3 text-brand-300" />
+          RAG vector DB
+        </span>
       </header>
 
-      <div className="mt-6 grid gap-6 lg:grid-cols-[minmax(0,65fr)_minmax(0,35fr)]">
+      <div className="mt-5 grid gap-6 lg:grid-cols-[minmax(0,65fr)_minmax(0,35fr)]">
         {/* ---------------------------- Left: documents --------------------------- */}
         <section className="min-w-0">
-          <PanelHeading
-            icon={BookOpen}
-            title="Knowledge base documents"
-            meta={`${filteredDocs.length} of ${kbDocs.length}`}
-          />
+          {/* ------------------------------ Upload -------------------------------- */}
+          <label
+            htmlFor="kb-file-input"
+            onDragOver={(event) => {
+              event.preventDefault();
+              setDragActive(true);
+            }}
+            onDragEnter={(event) => {
+              event.preventDefault();
+              setDragActive(true);
+            }}
+            onDragLeave={(event) => {
+              event.preventDefault();
+              setDragActive(false);
+            }}
+            onDrop={(event) => {
+              event.preventDefault();
+              setDragActive(false);
+              const file = event.dataTransfer.files?.[0];
+              if (file) void uploadFile(file);
+            }}
+            className={`flex cursor-pointer flex-col items-center justify-center rounded-xl2 border border-dashed px-4 py-5 text-center transition ${
+              dragActive
+                ? "border-brand-400 bg-brand-900/40"
+                : "border-charcoal-600 bg-charcoal-850/80 hover:border-brand-400/70"
+            }`}
+          >
+            <input
+              id="kb-file-input"
+              type="file"
+              accept={ACCEPTED_FILES}
+              className="sr-only"
+              disabled={upload?.status === "uploading"}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (file) void uploadFile(file);
+              }}
+            />
+            {upload?.status === "uploading" ? (
+              <Loader2 className="h-6 w-6 animate-spin text-brand-300" />
+            ) : (
+              <UploadCloud className="h-6 w-6 text-brand-300" />
+            )}
+            <p className="mt-2 text-xs font-medium text-cream-100">
+              {dragActive
+                ? "Drop to index into the RAG vector DB"
+                : "Drag & drop a company file, or click to browse"}
+            </p>
+            <p className="mt-1 text-[10px] uppercase tracking-wider text-ash-400">
+              .PDF · .TXT · .MD · .CSV — up to 2 MB
+            </p>
+          </label>
+
+          {/* --------------------------- Indexing toast --------------------------- */}
+          {upload ? (
+            <div
+              role="status"
+              aria-live="polite"
+              className={`mt-3 flex items-start gap-2.5 rounded-xl border px-3 py-2.5 ${
+                upload.status === "error"
+                  ? "border-charcoal-600 bg-charcoal-800/90"
+                  : "border-brand-400/40 bg-brand-900/40"
+              }`}
+            >
+              <span className="mt-0.5 shrink-0">
+                {upload.status === "uploading" ? (
+                  <Loader2 className="h-4 w-4 animate-spin text-brand-300" />
+                ) : upload.status === "done" ? (
+                  <Database className="h-4 w-4 text-cream-200" />
+                ) : (
+                  <AlertTriangle className="h-4 w-4 text-brand-300" />
+                )}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="text-[11px] font-semibold text-cream-50">
+                  {upload.status === "uploading"
+                    ? `Indexing ${upload.fileName}…`
+                    : upload.status === "done"
+                      ? `Indexed ${upload.chunkCount} chunks into RAG Vector DB`
+                      : `Could not index ${upload.fileName}`}
+                </p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-ash-300">
+                  {upload.status === "done"
+                    ? `${upload.fileName} · ${upload.chars?.toLocaleString("en-IN")} characters · 500-char windows with 100-char overlap`
+                    : upload.status === "error"
+                      ? upload.message
+                      : "Extracting text, splitting into overlapping chunks and writing vectors…"}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setUpload(null)}
+                aria-label="Dismiss indexing message"
+                className="focus-ring shrink-0 rounded-full text-ash-300 transition hover:text-cream-50"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ) : null}
+
+          <div className="mt-4">
+            <PanelHeading
+              icon={BookOpen}
+              title="Knowledge base documents"
+              meta={`${filteredDocs.length} of ${kbDocs.length}`}
+            />
+          </div>
 
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <div className="relative flex-1">
@@ -405,6 +748,9 @@ export default function KnowledgeBaseView() {
             {filteredDocs.map((doc) => {
               const isOpen = expandedId === doc.id;
               const entries = history[doc.id] ?? [];
+              const chunksOpen = openChunksId === doc.id;
+              const indexed = chunksByDoc[doc.id];
+              const chunkError = chunkErrors[doc.id];
 
               return (
                 <article
@@ -432,6 +778,11 @@ export default function KnowledgeBaseView() {
                           <Clock className="h-3 w-3" />
                           Updated {updatedFmt.format(new Date(doc.updatedAt))}
                         </span>
+                        {indexed ? (
+                          <span className="pill bg-brand-500/15 font-mono text-brand-200 ring-1 ring-inset ring-brand-400/40">
+                            {indexed.doc.chunkCount} vectors
+                          </span>
+                        ) : null}
                       </div>
                     </div>
                     <button
@@ -448,20 +799,45 @@ export default function KnowledgeBaseView() {
                     {doc.content}
                   </p>
 
-                  <div className="mt-3 flex items-center justify-between gap-2 border-t border-charcoal-700/70 pt-2.5">
-                    <button
-                      type="button"
-                      onClick={() => setExpandedId(isOpen ? null : doc.id)}
-                      aria-expanded={isOpen}
-                      className="focus-ring inline-flex items-center gap-1.5 rounded-full text-[11px] font-medium text-ash-300 transition hover:text-cream-100"
-                    >
-                      <History className="h-3 w-3" />
-                      Version history
-                      {entries.length > 0 ? ` (${entries.length})` : ""}
-                      <ChevronDown
-                        className={`h-3 w-3 transition-transform ${isOpen ? "rotate-180" : ""}`}
-                      />
-                    </button>
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-charcoal-700/70 pt-2.5">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => setExpandedId(isOpen ? null : doc.id)}
+                        aria-expanded={isOpen}
+                        className="focus-ring inline-flex items-center gap-1.5 rounded-full text-[11px] font-medium text-ash-300 transition hover:text-cream-100"
+                      >
+                        <History className="h-3 w-3" />
+                        Version history
+                        {entries.length > 0 ? ` (${entries.length})` : ""}
+                        <ChevronDown
+                          className={`h-3 w-3 transition-transform ${isOpen ? "rotate-180" : ""}`}
+                        />
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => void toggleChunks(doc)}
+                        aria-expanded={chunksOpen}
+                        className={`focus-ring inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition ${
+                          chunksOpen
+                            ? "border-brand-400 bg-brand-900/40 text-cream-50"
+                            : "border-charcoal-600 text-ash-300 hover:border-brand-400 hover:text-cream-100"
+                        }`}
+                      >
+                        {chunkLoadingId === doc.id ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Database className="h-3 w-3" />
+                        )}
+                        View Indexed Chunks
+                        {indexed ? ` (${indexed.doc.chunkCount})` : ""}
+                        <ChevronDown
+                          className={`h-3 w-3 transition-transform ${chunksOpen ? "rotate-180" : ""}`}
+                        />
+                      </button>
+                    </div>
+
                     <span className="font-mono text-[10px] uppercase tracking-wider text-ash-400">
                       {doc.id}
                     </span>
@@ -500,14 +876,89 @@ export default function KnowledgeBaseView() {
                       </p>
                     )
                   ) : null}
+
+                  {chunksOpen ? (
+                    <div className="mt-2.5 rounded-xl border border-charcoal-700 bg-charcoal-900/60 p-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-ash-300">
+                          <Database className="h-3 w-3 text-brand-300" />
+                          RAG vector store
+                        </span>
+                        <span className="font-mono text-[10px] text-ash-400">
+                          {indexed
+                            ? `${indexed.doc.chunkCount} chunks · ${indexed.doc.chars.toLocaleString("en-IN")} chars · ${indexed.doc.avgChunkChars} avg`
+                            : chunkLoadingId === doc.id
+                              ? "chunking…"
+                              : "not indexed yet"}
+                        </span>
+                      </div>
+
+                      {indexed ? (
+                        <>
+                          <p className="mt-1 text-[10px] text-ash-400">
+                            500-character windows · 100-character overlap ·{" "}
+                            {indexed.doc.source === "upload"
+                              ? "company file upload"
+                              : "policy article"}{" "}
+                            · indexed {updatedFmt.format(new Date(indexed.doc.indexedAt))}
+                          </p>
+                          <ol className="mt-2 space-y-2">
+                            {indexed.chunks.map((chunk) => (
+                              <li
+                                key={chunk.id}
+                                className="rounded-lg border border-charcoal-700 bg-charcoal-900/80 p-2.5"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-1.5">
+                                  <span className="font-mono text-[10px] text-cream-200">
+                                    chunk #{chunk.index + 1}
+                                  </span>
+                                  <span className="text-[10px] text-ash-400">
+                                    {chunk.chars} chars · offsets {chunk.start}–
+                                    {chunk.end}
+                                  </span>
+                                  <span className="pill bg-brand-500/15 text-[10px] text-brand-200 ring-1 ring-inset ring-brand-400/40">
+                                    <CheckCircle2 className="h-2.5 w-2.5" />
+                                    {chunk.vector.status} · {chunk.vector.dim}-d
+                                  </span>
+                                </div>
+                                <p className="mt-1.5 max-h-28 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-cream-100/85">
+                                  {chunk.text}
+                                </p>
+                                <p className="mt-1 font-mono text-[10px] text-ash-400">
+                                  vector[{chunk.vector.preview} …] · norm{" "}
+                                  {chunk.vector.norm}
+                                  {chunk.overlapsNext > 0
+                                    ? ` · overlaps next by ${chunk.overlapsNext} chars`
+                                    : " · final chunk"}
+                                </p>
+                              </li>
+                            ))}
+                          </ol>
+                        </>
+                      ) : null}
+
+                      {chunkLoadingId === doc.id ? (
+                        <p className="mt-2 inline-flex items-center gap-1.5 text-[11px] text-ash-300">
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          Splitting into 500-character chunks and writing vectors…
+                        </p>
+                      ) : null}
+
+                      {chunkError && chunkLoadingId !== doc.id ? (
+                        <p className="mt-2 text-[11px] leading-relaxed text-brand-200">
+                          {chunkError} Use “Edit” to save, then try again.
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </article>
               );
             })}
 
             {filteredDocs.length === 0 ? (
               <p className="panel px-4 py-8 text-center text-xs text-ash-400">
-                No articles match “{query.trim()}”. Create one from scratch or from a
-                knowledge gap.
+                No articles match “{query.trim()}”. Create one from scratch, from a
+                knowledge gap, or upload a company file.
               </p>
             ) : null}
           </div>
@@ -603,7 +1054,7 @@ export default function KnowledgeBaseView() {
           onSave={handleSave}
         />
       ) : null}
-    </main>
+    </div>
   );
 }
 
@@ -644,33 +1095,39 @@ function ArticleModal({
     title: string;
     category: KbCategory;
     content: string;
-  }) => void;
+  }) => Promise<void>;
 }) {
   const [title, setTitle] = useState(initial.title);
   const [category, setCategory] = useState<KbCategory>(initial.category);
   const [content, setContent] = useState(initial.content);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") onCancel();
+      if (event.key === "Escape" && !saving) onCancel();
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onCancel]);
+  }, [onCancel, saving]);
 
-  const canSave = title.trim().length > 0 && content.trim().length > 0;
+  const canSave = title.trim().length > 0 && content.trim().length > 0 && !saving;
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!canSave) return;
-    onSave({ title, category, content });
+    setSaving(true);
+    try {
+      await onSave({ title, category, content });
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-charcoal-950/80 p-4 backdrop-blur-sm sm:items-center"
       onClick={(event) => {
-        if (event.target === event.currentTarget) onCancel();
+        if (event.target === event.currentTarget && !saving) onCancel();
       }}
     >
       <div
@@ -706,7 +1163,8 @@ function ArticleModal({
             type="button"
             onClick={onCancel}
             aria-label="Close"
-            className="focus-ring rounded-full border border-charcoal-600 bg-charcoal-800 p-1.5 text-ash-300 transition hover:text-cream-50"
+            disabled={saving}
+            className="focus-ring rounded-full border border-charcoal-600 bg-charcoal-800 p-1.5 text-ash-300 transition hover:text-cream-50 disabled:opacity-50"
           >
             <X className="h-3.5 w-3.5" />
           </button>
@@ -772,25 +1230,31 @@ function ArticleModal({
           <div className="flex flex-col gap-2 border-t border-charcoal-700/70 pt-3 sm:flex-row sm:items-center sm:justify-between">
             <p className="text-[11px] text-ash-400">
               {mode === "edit"
-                ? `Saving bumps the minor version ${versionHint} and logs a history entry.`
+                ? `Saving bumps the minor version ${versionHint}, logs a history entry and re-indexes the article.`
                 : gap
-                  ? "Saving publishes the article and marks this gap resolved."
-                  : versionHint}
+                  ? "Saving writes the policy into the RAG vector DB and marks this gap resolved."
+                  : "Saving chunks the article into the RAG vector DB at v1.0."}
             </p>
             <div className="flex items-center justify-end gap-2">
               <button
                 type="button"
                 onClick={onCancel}
-                className="focus-ring rounded-full border border-charcoal-600 px-3.5 py-2 text-xs font-medium text-cream-100 transition hover:border-brand-400"
+                disabled={saving}
+                className="focus-ring rounded-full border border-charcoal-600 px-3.5 py-2 text-xs font-medium text-cream-100 transition hover:border-brand-400 disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 disabled={!canSave}
-                className="focus-ring rounded-full bg-brand-500 px-3.5 py-2 text-xs font-semibold text-cream-50 transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-50"
+                className="focus-ring inline-flex items-center gap-1.5 rounded-full bg-brand-500 px-3.5 py-2 text-xs font-semibold text-cream-50 transition hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {mode === "edit" ? "Save new version" : "Publish article"}
+                {saving ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                {saving
+                  ? "Indexing…"
+                  : mode === "edit"
+                    ? "Save new version"
+                    : "Publish article"}
               </button>
             </div>
           </div>
