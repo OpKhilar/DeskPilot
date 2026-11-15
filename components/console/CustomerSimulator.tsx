@@ -47,7 +47,6 @@ const QUICK_PROMPTS = [
 ];
 
 const ORDER_ID_RE = /ORD[\s-]*\d{2,6}/i;
-const CITATION_RE = /^(.*?)\s*\((v[0-9][0-9.]*)\)\s*$/i;
 
 interface SimMessage {
   id: string;
@@ -78,6 +77,14 @@ interface LlmChatResponse {
   category: TicketCategory;
   priority: TicketPriority;
   suggestedAgentReply: string;
+  retrievedChunks: {
+    docId: string;
+    title: string;
+    version: string;
+    chunkIndex: number;
+    text: string;
+    score: number;
+  }[];
   toolCall?: { name: string; arguments?: Record<string, unknown> } | null;
 }
 
@@ -124,33 +131,6 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
   return payload;
 }
 
-function extractSnippet(content: string, max = 180): string {
-  const end = content.indexOf(". ");
-  const sentence = end === -1 ? content : content.slice(0, end + 1);
-  const trimmed = sentence.trim();
-  return trimmed.length > max ? `${trimmed.slice(0, max).trim()}…` : trimmed;
-}
-
-/** Map the LLM's "Document Title (v1.2)" citation onto a real KB document. */
-function resolveCitation(raw: string | null, kbDocs: KbDoc[]): Citation | null {
-  if (!raw) return null;
-
-  const match = CITATION_RE.exec(raw.trim());
-  const title = (match?.[1] ?? raw).replace(/[()]/g, "").trim();
-  const doc = kbDocs.find(
-    (candidate) => candidate.title.toLowerCase() === title.toLowerCase(),
-  );
-
-  if (!doc) return null;
-
-  return {
-    docId: doc.id,
-    title: doc.title,
-    version: doc.version,
-    snippet: extractSnippet(doc.content),
-  };
-}
-
 function toolLogType(name: string): ActionLog["type"] {
   if (name === "escalate_to_human") return "escalation";
   if (name === "lookup_order") return "order_lookup";
@@ -158,17 +138,19 @@ function toolLogType(name: string): ActionLog["type"] {
   return "system";
 }
 
-function mapLlmTurn(payload: LlmChatResponse, kbDocs: KbDoc[]): SimTurn {
-  const citation = resolveCitation(payload.citation, kbDocs);
-  const actions: NewActionLog[] = [];
-
-  if (citation) {
-    actions.push({
-      type: "knowledge_lookup",
-      label: `Cited ${citation.title} ${citation.version}`,
-      detail: "Grounded in the supplied knowledge base",
-    });
-  }
+function mapLlmTurn(payload: LlmChatResponse): SimTurn {
+  const citations: Citation[] = payload.retrievedChunks.map((chunk) => ({
+    docId: chunk.docId,
+    title: chunk.title,
+    version: chunk.version,
+    snippet: chunk.text,
+  }));
+  const sources = [...new Set(citations.map(({ title, version }) => `${title} ${version}`))];
+  const actions: NewActionLog[] = sources.map((source) => ({
+    type: "knowledge_lookup",
+    label: `Retrieved ${source}`,
+    detail: "Exact RAG passages used as model context",
+  }));
 
   if (payload.toolCall) {
     const args = payload.toolCall.arguments
@@ -197,7 +179,7 @@ function mapLlmTurn(payload: LlmChatResponse, kbDocs: KbDoc[]): SimTurn {
 
   return {
     reply: payload.reply,
-    citations: citation ? [citation] : [],
+    citations,
     actions,
     knowledgeGap: payload.isKnowledgeGap,
     escalate: payload.escalate,
@@ -247,7 +229,7 @@ async function requestTurn(
     });
 
     if (response.ok) {
-      return mapLlmTurn((await response.json()) as LlmChatResponse, kbDocs);
+      return mapLlmTurn((await response.json()) as LlmChatResponse);
     }
   } catch {
     // Network or parse failure — fall through to the deterministic router.
