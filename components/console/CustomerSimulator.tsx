@@ -3,16 +3,29 @@
 // Floating customer-side chat used to demo DeskPilot end to end on one screen.
 //
 // Every message is mirrored into the real ticket through useDeskStore, so the
-// agent console reacts live. Understanding + policy answers come from
-// /api/chat; any money action is executed by /api/actions, where the ₹1,000
-// ceiling lives in code.
+// agent console reacts live. The LLM assistant at /api/chat answers when it is
+// configured; without an OPENAI_API_KEY it returns 503 and we fall back to the
+// deterministic policy router at /api/chat/simulate, so the demo always runs.
+//
+// Money never moves on model output: a refund tool call is executed through
+// /api/actions, where the ₹1,000 ceiling lives in code.
 
 import { useEffect, useRef, useState } from "react";
 import { MessageCircle, Send, Sparkles, X } from "lucide-react";
 import { useDeskStore } from "@/lib/store";
 import { newActionLog } from "@/lib/log";
 import type { ChatReplyPayload, RefundResult } from "@/lib/actions";
-import type { Citation, Ticket } from "@/lib/types";
+import type {
+  ActionLog,
+  Citation,
+  KbDoc,
+  NewActionLog,
+  Order,
+  Ticket,
+  TicketCategory,
+  TicketPriority,
+  TicketStatus,
+} from "@/lib/types";
 
 interface Persona {
   id: string;
@@ -34,12 +47,38 @@ const QUICK_PROMPTS = [
 ];
 
 const ORDER_ID_RE = /ORD[\s-]*\d{2,6}/i;
+const CITATION_RE = /^(.*?)\s*\((v[0-9][0-9.]*)\)\s*$/i;
 
 interface SimMessage {
   id: string;
   role: "customer" | "ai" | "system";
   text: string;
   citations?: Citation[];
+}
+
+/** One normalised assistant turn, whichever backend produced it. */
+interface SimTurn {
+  reply: string;
+  citations: Citation[];
+  actions: NewActionLog[];
+  knowledgeGap: boolean;
+  escalate: boolean;
+  priority?: TicketPriority;
+  category?: TicketCategory;
+  /** Order id the assistant wants refunded; executed via /api/actions. */
+  refundOrderId: string | null;
+  usedFallback?: boolean;
+}
+
+interface LlmChatResponse {
+  reply: string;
+  citation: string | null;
+  isKnowledgeGap: boolean;
+  escalate: boolean;
+  category: TicketCategory;
+  priority: TicketPriority;
+  suggestedAgentReply: string;
+  toolCall?: { name: string; arguments?: Record<string, unknown> } | null;
 }
 
 let simSequence = 0;
@@ -85,8 +124,152 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
   return payload;
 }
 
+function extractSnippet(content: string, max = 180): string {
+  const end = content.indexOf(". ");
+  const sentence = end === -1 ? content : content.slice(0, end + 1);
+  const trimmed = sentence.trim();
+  return trimmed.length > max ? `${trimmed.slice(0, max).trim()}…` : trimmed;
+}
+
+/** Map the LLM's "Document Title (v1.2)" citation onto a real KB document. */
+function resolveCitation(raw: string | null, kbDocs: KbDoc[]): Citation | null {
+  if (!raw) return null;
+
+  const match = CITATION_RE.exec(raw.trim());
+  const title = (match?.[1] ?? raw).replace(/[()]/g, "").trim();
+  const doc = kbDocs.find(
+    (candidate) => candidate.title.toLowerCase() === title.toLowerCase(),
+  );
+
+  if (!doc) return null;
+
+  return {
+    docId: doc.id,
+    title: doc.title,
+    version: doc.version,
+    snippet: extractSnippet(doc.content),
+  };
+}
+
+function toolLogType(name: string): ActionLog["type"] {
+  if (name === "escalate_to_human") return "escalation";
+  if (name === "lookup_order") return "order_lookup";
+  if (name === "create_refund_request") return "tool_call";
+  return "system";
+}
+
+function mapLlmTurn(payload: LlmChatResponse, kbDocs: KbDoc[]): SimTurn {
+  const citation = resolveCitation(payload.citation, kbDocs);
+  const actions: NewActionLog[] = [];
+
+  if (citation) {
+    actions.push({
+      type: "knowledge_lookup",
+      label: `Cited ${citation.title} ${citation.version}`,
+      detail: "Grounded in the supplied knowledge base",
+    });
+  }
+
+  if (payload.toolCall) {
+    const args = payload.toolCall.arguments
+      ? JSON.stringify(payload.toolCall.arguments)
+      : "no arguments";
+    actions.push({
+      type: toolLogType(payload.toolCall.name),
+      label: `Tool call · ${payload.toolCall.name}`,
+      detail: args.length > 120 ? `${args.slice(0, 120)}…` : args,
+    });
+  }
+
+  if (payload.escalate) {
+    actions.push({
+      type: "escalation",
+      label: "Escalated to a human agent",
+      detail: `${payload.category} · priority ${payload.priority}`,
+    });
+  }
+
+  const refundOrderId =
+    payload.toolCall?.name === "create_refund_request" &&
+    typeof payload.toolCall.arguments?.orderId === "string"
+      ? payload.toolCall.arguments.orderId
+      : null;
+
+  return {
+    reply: payload.reply,
+    citations: citation ? [citation] : [],
+    actions,
+    knowledgeGap: payload.isKnowledgeGap,
+    escalate: payload.escalate,
+    priority: payload.priority,
+    category: payload.category,
+    refundOrderId,
+  };
+}
+
+function mapSimTurn(payload: ChatReplyPayload): SimTurn {
+  return {
+    reply: payload.reply,
+    citations: payload.citations,
+    actions: payload.actions,
+    knowledgeGap: payload.knowledgeGap,
+    escalate: false,
+    refundOrderId: payload.toolCall?.orderId ?? null,
+    usedFallback: true,
+  };
+}
+
+/** Ask the LLM assistant first; degrade to the deterministic router on 5xx/503. */
+async function requestTurn(
+  text: string,
+  ticket: Ticket,
+  history: SimMessage[],
+  kbDocs: KbDoc[],
+  orders: Order[],
+  persona: Persona,
+): Promise<SimTurn> {
+  const messages = [
+    ...history
+      .filter((message) => message.role !== "system")
+      .slice(-9)
+      .map((message) => ({
+        role: message.role === "customer" ? "customer" : "assistant",
+        content: message.text,
+      })),
+    { role: "customer", content: text },
+  ];
+
+  try {
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticketId: ticket.id, messages, kbDocs, orders }),
+    });
+
+    if (response.ok) {
+      return mapLlmTurn((await response.json()) as LlmChatResponse, kbDocs);
+    }
+  } catch {
+    // Network or parse failure — fall through to the deterministic router.
+  }
+
+  const fallback = await postJSON<ChatReplyPayload>("/api/chat/simulate", {
+    message: text,
+    orderId: persona.orderId,
+  });
+
+  return mapSimTurn(fallback);
+}
+
 export default function CustomerSimulator() {
-  const { tickets, addTicketMessage, addKnowledgeGap, updateTicket } = useDeskStore();
+  const {
+    tickets,
+    orders,
+    kbDocs,
+    addTicketMessage,
+    addKnowledgeGap,
+    updateTicket,
+  } = useDeskStore();
 
   const [open, setOpen] = useState(false);
   const [personaId, setPersonaId] = useState(PERSONAS[0].id);
@@ -136,21 +319,18 @@ export default function CustomerSimulator() {
     });
 
     try {
-      const chat = await postJSON<ChatReplyPayload>("/api/chat", {
-        message: text,
-        orderId: persona.orderId,
-      });
+      const turn = await requestTurn(text, ticket, thread, kbDocs, orders, persona);
 
-      let reply = chat.reply;
-      const actions = chat.actions.map((action) =>
+      let reply = turn.reply;
+      const actions = turn.actions.map((action) =>
         newActionLog(action.type, action.label, action.detail),
       );
-      let escalated = false;
+      let escalate = turn.escalate;
 
-      if (chat.toolCall) {
+      if (turn.refundOrderId) {
         const refund = await postJSON<RefundResult>("/api/actions", {
           action: "process_refund",
-          orderId: chat.toolCall.orderId,
+          orderId: turn.refundOrderId,
           reason: text,
         });
 
@@ -160,7 +340,7 @@ export default function CustomerSimulator() {
             newActionLog(
               "tool_call",
               `Refund executed · ₹${refund.refundAmount}`,
-              `${chat.toolCall.orderId} · auto-approved at or below ₹1,000`,
+              `${turn.refundOrderId} · auto-approved at or below ₹1,000`,
             ),
           );
         } else if (refund.status === "GUARDRAIL_BLOCKED") {
@@ -169,12 +349,12 @@ export default function CustomerSimulator() {
             newActionLog(
               "escalation",
               "Guardrail blocked the refund",
-              `₹${refund.refundAmount} > ₹1,000 ceiling · ${chat.toolCall.orderId} · priority URGENT`,
+              `₹${refund.refundAmount} > ₹1,000 ceiling · ${turn.refundOrderId} · priority URGENT`,
             ),
           );
-          escalated = true;
+          escalate = true;
         } else {
-          reply = `I couldn't find ${chat.toolCall.orderId} in our records. Could you re-check the order ID from your confirmation message?`;
+          reply = `I couldn't find ${turn.refundOrderId} in our records. Could you re-check the order ID from your confirmation message?`;
         }
       }
 
@@ -182,21 +362,43 @@ export default function CustomerSimulator() {
         sender: "ai",
         senderName: "DeskPilot AI",
         text: reply,
-        citations: chat.citations.length ? chat.citations : undefined,
+        citations: turn.citations.length ? turn.citations : undefined,
         actions,
       });
 
-      setThread((prev) => [
-        ...prev,
-        { id: nextId(), role: "ai", text: reply, citations: chat.citations },
-      ]);
+      setThread((prev) => {
+        const next: SimMessage[] = [
+          ...prev,
+          { id: nextId(), role: "ai", text: reply, citations: turn.citations },
+        ];
+        if (turn.usedFallback) {
+          next.push({
+            id: nextId(),
+            role: "system",
+            text: "LLM route unavailable (no OPENAI_API_KEY?) — answered with the deterministic policy router.",
+          });
+        }
+        return next;
+      });
 
-      if (chat.knowledgeGap) addKnowledgeGap(text, ticket.channel);
+      if (turn.knowledgeGap) addKnowledgeGap(text, ticket.channel);
 
-      // A blocked refund is a human's problem now.
-      if (escalated && ticket.status === "ai_handling") {
-        updateTicket(ticket.id, { status: "escalated", priority: "urgent" });
+      // Classifier output and escalations land on the ticket so the console
+      // queue reflects them immediately.
+      const patch: {
+        priority?: TicketPriority;
+        category?: TicketCategory;
+        status?: TicketStatus;
+      } = {};
+
+      if (turn.category) patch.category = turn.category;
+      if (turn.priority) patch.priority = turn.priority;
+      if (escalate) {
+        patch.priority = "urgent";
+        if (ticket.status === "ai_handling") patch.status = "escalated";
       }
+
+      if (Object.keys(patch).length > 0) updateTicket(ticket.id, patch);
     } catch (error) {
       setThread((prev) => [
         ...prev,
