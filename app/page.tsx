@@ -1,12 +1,14 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   AlertTriangle,
+  BarChart3,
   BookOpen,
   Bot,
   Clock,
   IndianRupee,
+  Inbox,
   LifeBuoy,
   MessageSquareQuote,
   Package,
@@ -16,6 +18,7 @@ import {
   UserRound,
   Wand2,
 } from "lucide-react";
+import AnalyticsView from "@/components/analytics/AnalyticsView";
 import { useDeskStore } from "@/lib/store";
 import type {
   KnowledgeGapStatus,
@@ -102,6 +105,7 @@ function lastCustomerFacingMessage(ticket: Ticket) {
 }
 
 export default function DeskOverviewPage() {
+  const [tab, setTab] = useState<"inbox" | "analytics">("inbox");
   const {
     tickets,
     orders,
@@ -150,6 +154,44 @@ export default function DeskOverviewPage() {
         </button>
       </header>
 
+      <nav
+        aria-label="Dashboard views"
+        className="mt-6 inline-flex items-center gap-1 rounded-full border border-charcoal-600 bg-charcoal-800/80 p-1"
+      >
+        <button
+          type="button"
+          onClick={() => setTab("inbox")}
+          aria-current={tab === "inbox" ? "page" : undefined}
+          className={`focus-ring inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-medium transition ${
+            tab === "inbox"
+              ? "bg-cream-200 text-charcoal-900"
+              : "text-ash-300 hover:bg-charcoal-700/70 hover:text-cream-100"
+          }`}
+        >
+          <Inbox className="h-3.5 w-3.5" />
+          Inbox
+        </button>
+        <button
+          type="button"
+          onClick={() => setTab("analytics")}
+          aria-current={tab === "analytics" ? "page" : undefined}
+          className={`focus-ring inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-medium transition ${
+            tab === "analytics"
+              ? "bg-cream-200 text-charcoal-900"
+              : "text-ash-300 hover:bg-charcoal-700/70 hover:text-cream-100"
+          }`}
+        >
+          <BarChart3 className="h-3.5 w-3.5" />
+          Analytics
+        </button>
+      </nav>
+
+      {tab === "analytics" ? (
+        <div className="mt-6">
+          <AnalyticsView />
+        </div>
+      ) : (
+        <>
       <section className="mt-7 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard
           icon={LifeBuoy}
@@ -386,6 +428,8 @@ export default function DeskOverviewPage() {
           ? "Demo data is stored in localStorage · reset anytime"
           : "Loading local workspace…"}
       </p>
+        </>
+      )}
     </main>
   );
 }
