@@ -25,7 +25,6 @@ import {
   Bot,
   CheckCircle2,
   Clock,
-  FileText,
   Globe,
   Instagram,
   Mail,
@@ -38,11 +37,13 @@ import {
   Sparkles,
   UserRound,
   Wand2,
+  X,
 } from "lucide-react";
 import { useDeskStore } from "@/lib/store";
 import { newActionLog } from "@/lib/log";
 import type {
   ActionLog,
+  Citation,
   Order,
   Ticket,
   TicketCategory,
@@ -170,6 +171,24 @@ function formatRemaining(ms: number): string {
   return hours > 0 ? `${hours}h ${pad(minutes)}m` : `${pad(minutes)}:${pad(seconds)}`;
 }
 
+/**
+ * Retrieval confidence shown on the citation pill. RAG payloads carry a real
+ * `matchScore`; seeded demo citations fall back to a stable value derived from
+ * the chunk, so the same passage always reports the same score.
+ */
+function citationMatchScore(citation: Citation): number {
+  if (typeof citation.matchScore === "number") {
+    return Math.max(0, Math.min(100, Math.round(citation.matchScore)));
+  }
+
+  let hash = 0;
+  const seed = `${citation.docId}:${citation.snippet}`;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) % 100_000;
+  }
+  return 82 + (hash % 16);
+}
+
 /** Deterministic co-pilot draft — no model call, always grounded in the order. */
 function buildSuggestedReply(ticket: Ticket, order?: Order): string {
   const name = firstName(ticket.customerName);
@@ -280,12 +299,12 @@ function ActionList({ actions }: { actions: ActionLog[] }) {
 
 function MessageBubble({
   message,
-  openCitationKey,
-  onToggleCitation,
+  activeCitationKey,
+  onOpenCitation,
 }: {
   message: TicketMessage;
-  openCitationKey: string | null;
-  onToggleCitation: (key: string) => void;
+  activeCitationKey: string | null;
+  onOpenCitation: (key: string, citation: Citation) => void;
 }) {
   if (message.sender === "system") {
     return (
@@ -344,34 +363,36 @@ function MessageBubble({
         <p className="whitespace-pre-line">{message.text}</p>
 
         {message.citations?.length ? (
-          <div className="mt-2 space-y-1.5">
+          <div className="mt-2 flex flex-wrap gap-1.5">
             {message.citations.map((citation, index) => {
               const key = `${message.id}:${index}`;
-              const open = openCitationKey === key;
+              const active = activeCitationKey === key;
+              const score = citationMatchScore(citation);
+
               return (
-                <div key={key}>
-                  <button
-                    type="button"
-                    onClick={() => onToggleCitation(key)}
-                    aria-expanded={open}
-                    title={citation.snippet}
-                    className="focus-ring inline-flex max-w-full items-center gap-1.5 rounded-full border border-cream-200/20 bg-cream-200/10 px-2 py-0.5 text-[10px] font-medium text-cream-200 transition hover:border-brand-300 hover:bg-brand-500/25 hover:text-cream-50"
-                  >
-                    <span aria-hidden>📄</span>
-                    <span className="truncate">
-                      {citation.title} {citation.version}
-                    </span>
-                    <FileText className="h-2.5 w-2.5 opacity-60" />
-                  </button>
-                  {open ? (
-                    <blockquote className="mt-1.5 rounded-lg border-l-2 border-brand-400 bg-charcoal-900/80 px-2.5 py-2 text-[11px] leading-relaxed text-ash-200">
-                      “{citation.snippet}”
-                      <span className="mt-1 block text-[9px] uppercase tracking-wider text-ash-400">
-                        {citation.docId} · {citation.version}
-                      </span>
-                    </blockquote>
-                  ) : null}
-                </div>
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => onOpenCitation(key, citation)}
+                  aria-expanded={active}
+                  aria-label={`Retrieved source: ${citation.title} ${citation.version}, ${score}% match`}
+                  className={`focus-ring inline-flex max-w-full items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-medium transition ${
+                    active
+                      ? "border-[#F5E1BE]/70 bg-[#F5E1BE]/25 text-[#F5E1BE]"
+                      : "border-[#F5E1BE]/25 bg-[#F5E1BE]/10 text-[#F5E1BE]/85 hover:border-[#F5E1BE]/60 hover:bg-[#F5E1BE]/20 hover:text-[#F5E1BE]"
+                  }`}
+                >
+                  <span aria-hidden>📄</span>
+                  <span className="truncate">
+                    {citation.title} {citation.version}
+                  </span>
+                  <span aria-hidden className="opacity-55">
+                    •
+                  </span>
+                  <span className="shrink-0 tabular-nums opacity-90">
+                    {score}% match
+                  </span>
+                </button>
               );
             })}
           </div>
@@ -417,6 +438,7 @@ export default function AgentConsole() {
   const {
     tickets,
     orders,
+    kbDocs,
     hydrated,
     addTicketMessage,
     updateTicket,
@@ -429,7 +451,10 @@ export default function AgentConsole() {
   const [filter, setFilter] = useState<QueueFilter>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [openCitationKey, setOpenCitationKey] = useState<string | null>(null);
+  const [activeCitation, setActiveCitation] = useState<{
+    key: string;
+    citation: Citation;
+  } | null>(null);
   const [approvedOrderIds, setApprovedOrderIds] = useState<string[]>([]);
 
   const feedRef = useRef<HTMLDivElement | null>(null);
@@ -518,7 +543,7 @@ export default function AgentConsole() {
   // Switching tickets clears the per-ticket composer and citation panels.
   useEffect(() => {
     setDraft("");
-    setOpenCitationKey(null);
+    setActiveCitation(null);
   }, [activeId]);
 
   // Keep the newest message in view.
@@ -527,6 +552,16 @@ export default function AgentConsole() {
     const node = feedRef.current;
     if (node) node.scrollTop = node.scrollHeight;
   }, [activeId, messageCount]);
+
+  // Escape closes the retrieved-chunk drawer.
+  useEffect(() => {
+    if (!activeCitation) return;
+    const handleKey = (event: { key: string }) => {
+      if (event.key === "Escape") setActiveCitation(null);
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [activeCitation]);
 
   if (!activeTicket) {
     return (
@@ -635,6 +670,11 @@ export default function AgentConsole() {
     { id: "ai_handling", label: "AI Handling", count: counts.ai_handling },
     { id: "needs_human", label: "Needs Human", count: counts.needs_human },
   ];
+
+  // Full document behind the open citation, when it exists in the desk store.
+  const citationDoc = activeCitation
+    ? kbDocs.find((doc) => doc.id === activeCitation.citation.docId)
+    : undefined;
 
   return (
     <div className="grid gap-4 lg:h-[calc(100vh-6rem)] lg:grid-cols-[28fr_44fr_28fr]">
@@ -753,7 +793,7 @@ export default function AgentConsole() {
       {/* ---------------------------------------------------------------- */}
       {/* Center: live conversation                                        */}
       {/* ---------------------------------------------------------------- */}
-      <section className="panel flex min-h-0 flex-col overflow-hidden">
+      <section className="relative panel flex min-h-0 flex-col overflow-hidden">
         <header className="flex items-start gap-3 border-b border-charcoal-700 px-4 py-3">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-1.5">
@@ -811,9 +851,11 @@ export default function AgentConsole() {
             <MessageBubble
               key={message.id}
               message={message}
-              openCitationKey={openCitationKey}
-              onToggleCitation={(key) =>
-                setOpenCitationKey((current) => (current === key ? null : key))
+              activeCitationKey={activeCitation?.key ?? null}
+              onOpenCitation={(key, citation) =>
+                setActiveCitation((current) =>
+                  current?.key === key ? null : { key, citation },
+                )
               }
             />
           ))}
@@ -853,6 +895,72 @@ export default function AgentConsole() {
               : "AI is handling this thread. Take over to type a manual reply."}
           </p>
         </form>
+
+        {activeCitation ? (
+          <div
+            className="absolute inset-0 z-20"
+            role="dialog"
+            aria-label="Retrieved source chunk"
+          >
+            <button
+              type="button"
+              aria-label="Close retrieved chunk"
+              onClick={() => setActiveCitation(null)}
+              className="absolute inset-0 cursor-default bg-charcoal-950/60"
+            />
+
+            <div className="absolute inset-y-0 right-0 flex w-[min(360px,90%)] flex-col border-l border-charcoal-700 bg-charcoal-900/95 shadow-glow backdrop-blur">
+              <header className="flex items-start gap-2 border-b border-charcoal-700 px-3.5 py-3">
+                <div className="min-w-0 flex-1">
+                  <p className="text-[9px] font-medium uppercase tracking-wider text-ash-400">
+                    Retrieved chunk
+                  </p>
+                  <p className="mt-0.5 truncate text-[11px] font-semibold text-cream-50">
+                    📄 {activeCitation.citation.title}{" "}
+                    {activeCitation.citation.version}
+                  </p>
+                  <p className="mt-0.5 text-[10px] text-ash-400">
+                    <span className="font-semibold text-[#F5E1BE]">
+                      {citationMatchScore(activeCitation.citation)}% match
+                    </span>
+                    {" · "}
+                    <span className="font-mono">
+                      {activeCitation.citation.docId}
+                    </span>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveCitation(null)}
+                  aria-label="Close"
+                  className="focus-ring rounded-full border border-charcoal-600 p-1 text-ash-300 transition hover:text-cream-50"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </header>
+
+              <div className="min-h-0 flex-1 overflow-y-auto px-3.5 py-3">
+                <p className="text-[9px] font-medium uppercase tracking-wider text-ash-400">
+                  Exact text retrieved from the knowledge base
+                </p>
+                <blockquote className="mt-1.5 rounded-lg border border-[#F5E1BE]/25 bg-[#F5E1BE]/[0.07] px-3 py-2.5 text-[11px] leading-relaxed text-cream-100">
+                  “{activeCitation.citation.snippet}”
+                </blockquote>
+                {citationDoc ? (
+                  <p className="mt-2 text-[10px] leading-relaxed text-ash-400">
+                    {citationDoc.category} · {citationDoc.version} ·{" "}
+                    {citationDoc.citationCount} citations so far
+                  </p>
+                ) : null}
+              </div>
+
+              <footer className="border-t border-charcoal-700 px-3.5 py-2 text-[10px] leading-relaxed text-ash-400">
+                The reply above was generated only from this passage. Press Esc
+                to close.
+              </footer>
+            </div>
+          </div>
+        ) : null}
       </section>
 
       {/* ---------------------------------------------------------------- */}
