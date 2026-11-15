@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body {
+    @apply bg-charcoal-900 text-cream-100 antialiased;
+  }
+
+  body {
+    background-image:
+      radial-gradient(60rem 32rem at 12% -10%, rgba(115, 48, 21, 0.32), transparent 60%),
+      radial-gradient(44rem 28rem at 92% 0%, rgba(245, 225, 190, 0.06), transparent 55%);
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    @apply bg-brand-500 text-cream-50;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #3a2d25 transparent;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-xl2 border border-charcoal-700 bg-charcoal-850/80 shadow-soft backdrop-blur-sm;
+  }
+
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium tracking-wide;
+  }
+
+  .focus-ring {
+    @apply outline-none focus-visible:ring-2 focus-visible:ring-cream-200/70 focus-visible:ring-offset-2 focus-visible:ring-offset-charcoal-900;
+  }
+}
