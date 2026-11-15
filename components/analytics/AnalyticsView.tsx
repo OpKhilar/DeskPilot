@@ -218,7 +218,7 @@ export default function AnalyticsView() {
   const topGaps = unanswered.slice(0, 5);
 
   return (
-    <main className="mx-auto w-full max-w-7xl px-5 py-8 sm:px-8">
+    <div className="w-full">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div className="flex items-center gap-3">
           <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-brand-500 text-cream-100 shadow-glow">
@@ -462,7 +462,7 @@ export default function AnalyticsView() {
           )}
         </div>
       </section>
-    </main>
+    </div>
   );
 }
 
