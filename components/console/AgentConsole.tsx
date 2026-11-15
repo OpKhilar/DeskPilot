@@ -40,6 +40,7 @@ import {
   Wand2,
 } from "lucide-react";
 import { useDeskStore } from "@/lib/store";
+import { newActionLog } from "@/lib/log";
 import type {
   ActionLog,
   Order,
@@ -157,21 +158,6 @@ function initials(name: string): string {
 
 function firstName(name: string): string {
   return name.trim().split(/\s+/)[0] ?? name;
-}
-
-/** Full ActionLog for optimistic writes — the store does not fill these in. */
-function makeAction(
-  type: ActionLog["type"],
-  label: string,
-  detail: string,
-): ActionLog {
-  return {
-    id: `act-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
-    type,
-    label,
-    detail,
-    timestamp: new Date().toISOString(),
-  };
 }
 
 /** "2h 14m" past the hour, or "04:23" inside the final hour. */
@@ -563,7 +549,7 @@ export default function AgentConsole() {
     addTicketMessage(activeTicket.id, {
       sender: "system",
       text,
-      actions: [makeAction(action.type, action.label, action.detail)],
+      actions: [newActionLog(action.type, action.label, action.detail)],
     });
   }
 
@@ -635,7 +621,7 @@ export default function AgentConsole() {
       sender: "system",
       text: `Manager approval recorded: ${inr.format(order.amount)} refund on ${order.id} cleared by ${AGENT_NAME}. Refund will land on the original payment method in 5–7 working days.`,
       actions: [
-        makeAction(
+        newActionLog(
           "tool_call",
           `Guardrail refund approved · ${inr.format(order.amount)}`,
           `${order.id} · above ${inr.format(GUARDRAIL_REFUND_LIMIT)} ceiling · manual approval`,
