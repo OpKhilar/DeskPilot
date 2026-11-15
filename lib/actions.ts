@@ -1,198 +1,108 @@
-// DeskPilot action layer — deterministic, side-effect-free support actions.
+import type { Citation, NewActionLog, Order } from "./types";
+
+// Deterministic support actions and the money guardrail.
 //
-// WHY THIS FILE EXISTS
-// --------------------
-// The AI model may *propose* a refund, but it never gets to decide whether money
-// moves. Every money-touching action is executed here in plain TypeScript that a
-// human can read end-to-end. The model only chooses *which* function to call and
-// with what arguments; the limits below are enforced by code, not by prose in a
-// system prompt. A prompt can be jailbroken / hallucinated around; an `if` cannot.
-//
-// Both functions are pure: they take the order list as an argument and return a
-// result object. No network, no database, no clock, no randomness. That makes
-// them trivially testable and safe to call from the API route.
+// The refund ceiling is a constant in this module, not a sentence in a prompt:
+// no matter what the model or the browser asks for, processRefund is the only
+// code path that can approve a refund and it refuses anything above the limit.
 
-import type { Order } from "./types";
+/** Refunds at or below this amount may execute without a human. */
+export const AUTO_REFUND_LIMIT = 1000;
 
-/* -------------------------------------------------------------------------- */
-/* Guardrail configuration                                                    */
-/* -------------------------------------------------------------------------- */
+export interface OrderFoundResult {
+  status: "FOUND";
+  found: true;
+  order: Order;
+}
 
-/**
- * Hardcoded financial guardrail: automatic refunds are allowed up to and
- * including ₹1,000.
- *
- * This constant is intentionally NOT configurable per request, not readable
- * from the LLM's output, and not overridable by a function argument. The only
- * way to change the policy is to edit this file and ship a code review.
- *
- * All order amounts in DeskPilot are whole rupees (see lib/types.ts), so the
- * comparison is exact integer arithmetic — no float rounding edge cases.
- */
-export const AUTO_REFUND_LIMIT_INR = 1000;
+export interface OrderNotFoundResult {
+  status: "NOT_FOUND";
+  found: false;
+  orderId: string;
+  message: string;
+}
 
-/* -------------------------------------------------------------------------- */
-/* Result types                                                               */
-/* -------------------------------------------------------------------------- */
+export type LookupResult = OrderFoundResult | OrderNotFoundResult;
 
-export type RefundStatus = "APPROVED" | "GUARDRAIL_BLOCKED" | "NOT_FOUND";
-
-export interface ApprovedRefund {
+export interface RefundApproved {
   status: "APPROVED";
   refundAmount: number;
   message: string;
   escalationRequired: false;
 }
 
-export interface BlockedRefund {
+export interface RefundBlocked {
   status: "GUARDRAIL_BLOCKED";
   refundAmount: number;
   message: string;
   escalationRequired: true;
-  /** Blocked refunds always jump the queue to the most urgent priority. */
   newPriority: "URGENT";
 }
 
 export interface RefundNotFound {
   status: "NOT_FOUND";
-  refundAmount: 0;
   message: string;
   escalationRequired: false;
 }
 
-export type RefundResult = ApprovedRefund | BlockedRefund | RefundNotFound;
+export type RefundResult = RefundApproved | RefundBlocked | RefundNotFound;
 
-export interface OrderFound {
-  status: "FOUND";
-  order: Order;
-  message: string;
-}
-
-export interface OrderNotFound {
-  status: "NOT_FOUND";
-  order: null;
-  message: string;
-}
-
-export type OrderLookupResult = OrderFound | OrderNotFound;
-
-/* -------------------------------------------------------------------------- */
-/* 1) lookupOrder                                                             */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Find an order by id, case-insensitively, tolerating stray whitespace.
- *
- * Returns the full order record when found, or a clear NOT_FOUND result — never
- * `undefined`, so callers (and the model reading the tool output) always get an
- * explicit, human-readable answer instead of silently proceeding.
- */
+/** Case-insensitive order lookup. Never throws on a missing id. */
 export function lookupOrder(
   orderId: string,
   orders: readonly Order[],
-): OrderLookupResult {
-  const needle = (orderId ?? "").trim().toLowerCase();
-
-  if (!needle) {
-    return {
-      status: "NOT_FOUND",
-      order: null,
-      message: "NOT_FOUND: no order id was provided.",
-    };
-  }
-
-  // Case-insensitive match: "ord-103" and "ORD-103" resolve to the same order.
-  const order = orders.find(
-    (candidate) => candidate.id.toLowerCase() === needle,
-  );
+): LookupResult {
+  const needle = orderId.trim().toLowerCase();
+  const order = orders.find((candidate) => candidate.id.toLowerCase() === needle);
 
   if (!order) {
     return {
       status: "NOT_FOUND",
-      order: null,
-      message: `NOT_FOUND: no order exists with id "${orderId.trim()}". Ask the customer to confirm the order id before taking any action.`,
+      found: false,
+      orderId: orderId.trim(),
+      message: `NOT_FOUND: No order matches ${orderId.trim() || "(empty id)"}. Check the order ID and try again.`,
     };
   }
 
-  return {
-    status: "FOUND",
-    order,
-    message: `Found order ${order.id} for ${order.customerName} — ₹${order.amount}, ${order.status}, paid via ${order.paymentMethod}.`,
-  };
+  return { status: "FOUND", found: true, order };
 }
 
-/* -------------------------------------------------------------------------- */
-/* 2) processRefund                                                           */
-/* -------------------------------------------------------------------------- */
-
 /**
- * Attempt an automatic refund for an order.
- *
- * Control flow, in order:
- *
- *   1. Verify the order exists (same lookup as `lookupOrder`). A refund for an
- *      unknown order is refused — we never move money against an unverified id
- *      or a hallucinated order number.
- *
- *   2. Apply the HARDCODED GUARDRAIL on `order.amount`:
- *
- *        amount <= ₹1,000  ->  AUTO-APPROVE. Refund the full order amount to the
- *                              original payment method. No human needed.
- *
- *        amount >  ₹1,000  ->  BLOCK. Do not execute. The model is not allowed
- *                              to refund large amounts on its own; the request
- *                              is returned to the human queue flagged
- *                              escalationRequired + priority URGENT so a manager
- *                              reviews and approves it manually.
- *
- * The check is `<=` on an integer rupee amount, so exactly ₹1,000 auto-approves
- * and ₹1,001 is blocked. The limit lives in `AUTO_REFUND_LIMIT_INR` above and
- * is compared here — it is not derived from the model output, the ticket text,
- * or a request parameter, so no prompt injection can raise it.
+ * Refund decision. Verifies the order, then applies the hardcoded ceiling:
+ * ≤ ₹1,000 executes, anything above is blocked and escalated.
  */
 export function processRefund(
   orderId: string,
   reason: string,
   orders: readonly Order[],
 ): RefundResult {
-  // Step 1 — the order must exist. Fail closed on unknown ids.
+  // `reason` is logged by the caller; the decision never depends on its wording.
+  void reason;
+
   const lookup = lookupOrder(orderId, orders);
 
-  if (lookup.status === "NOT_FOUND") {
+  if (!lookup.found) {
     return {
       status: "NOT_FOUND",
-      refundAmount: 0,
-      message: lookup.message,
+      message: `NOT_FOUND: No order matches ${orderId.trim() || "(empty id)"}. Refund not processed.`,
       escalationRequired: false,
     };
   }
 
-  const order = lookup.order;
-  const refundAmount = order.amount;
+  const { order } = lookup;
 
-  // `reason` is recorded in the audit trail (see describeRefundDecision) and is
-  // deliberately NOT used to decide the outcome: a persuasive reason cannot
-  // unlock a larger refund.
-
-  // Step 2 — HARDCODED FINANCIAL GUARDRAIL (the part evaluators should read
-  // first). Small amounts are safe to automate; anything above the limit must
-  // go to a human. There is no bypass flag and no override parameter.
-  if (refundAmount <= AUTO_REFUND_LIMIT_INR) {
-    // Within the automation budget: approve immediately, full amount back to the
-    // original payment method.
+  if (order.amount <= AUTO_REFUND_LIMIT) {
     return {
       status: "APPROVED",
-      refundAmount,
-      message: `Auto-refunded ₹${refundAmount} to original payment method.`,
+      refundAmount: order.amount,
+      message: `Auto-refunded ₹${order.amount} to original payment method.`,
       escalationRequired: false,
     };
   }
 
-  // Above the automation budget: block execution and hand over to a human.
-  // Note that `refundAmount` is reported for context — it has NOT been paid out.
   return {
     status: "GUARDRAIL_BLOCKED",
-    refundAmount,
+    refundAmount: order.amount,
     message:
       "Guardrail Triggered: Refunds above ₹1,000 require human manager approval.",
     escalationRequired: true,
@@ -200,12 +110,23 @@ export function processRefund(
   };
 }
 
-/** Human-readable audit line for a refund decision, safe to log. */
-export function describeRefundDecision(
-  result: RefundResult,
-  orderId: string,
-  reason: string,
-): string {
-  const why = reason?.trim() || "no reason supplied";
-  return `refund ${orderId}: ${result.status} (₹${result.refundAmount}) — ${why}`;
+/* -------------------------------------------------------------------------- */
+/* /api/chat contract                                                         */
+/* -------------------------------------------------------------------------- */
+
+export interface ChatToolCall {
+  action: "process_refund";
+  orderId: string;
+  reason: string;
+}
+
+export interface ChatReplyPayload {
+  /** Assistant text. Empty when the caller should execute `toolCall` first. */
+  reply: string;
+  citations: Citation[];
+  actions: NewActionLog[];
+  /** Set when the turn needs a deterministic money action via /api/actions. */
+  toolCall: ChatToolCall | null;
+  /** True when the question had no grounded answer and must be logged. */
+  knowledgeGap: boolean;
 }
